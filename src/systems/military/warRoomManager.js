@@ -770,12 +770,31 @@ async function checkWarRoomAttacks(client) {
         // (cached, same as watch rooms) whether they've now declared
         // against this room's enemy, and if so activate them in place
         // instead of leaving them silently untracked forever.
-        const theirWars = await getWatchedNationWars(nation_id);
-        const matched = theirWars.find(w => String(w.attid) === String(room.enemy_nation_id) || String(w.defid) === String(room.enemy_nation_id));
-        if (!matched) continue;
-        war_id = matched.id;
-        run('UPDATE war_room_members SET war_id=? WHERE id=?', [war_id, memberRowId]);
-        logger.info(`Activated protected member ${nation_name} (nation ${nation_id}) in room ${room.id} — war ${war_id} found live.`);
+        try {
+          const theirWars = await getWatchedNationWars(nation_id);
+          const matched = theirWars.find(w => String(w.attid) === String(room.enemy_nation_id) || String(w.defid) === String(room.enemy_nation_id));
+          if (!matched) continue;
+          war_id = matched.id;
+
+          // If another row in this room already tracks this exact war
+          // (e.g. a leftover duplicate entry for the same nation), setting
+          // this row's war_id would violate the UNIQUE(war_room_id, war_id)
+          // constraint and throw — which previously aborted the ENTIRE
+          // attack-checking cycle for every room, not just this one. Detect
+          // that first and just drop the redundant row instead of colliding.
+          const conflict = queryOne('SELECT id FROM war_room_members WHERE war_room_id=? AND war_id=?', [room.id, war_id]);
+          if (conflict && conflict.id !== memberRowId) {
+            run('DELETE FROM war_room_members WHERE id=?', [memberRowId]);
+            logger.warn(`Removed duplicate pending member row ${memberRowId} (nation ${nation_id}, room ${room.id}) — war ${war_id} already tracked by row ${conflict.id}.`);
+            continue;
+          }
+
+          run('UPDATE war_room_members SET war_id=? WHERE id=?', [war_id, memberRowId]);
+          logger.info(`Activated protected member ${nation_name} (nation ${nation_id}) in room ${room.id} — war ${war_id} found live.`);
+        } catch (err) {
+          logger.error(`Failed to activate protected member ${nation_name} (nation ${nation_id}, room ${room.id}): ${err.message}`);
+          continue;
+        }
       }
 
       if (warMap.has(String(war_id))) continue;
